@@ -75,13 +75,25 @@ def buscar_en_directorio(consulta: str):
 
 
 def extraer_tool_call(data: dict):
-    """Devuelve (tool_call_id, arguments_dict). Lanza KeyError/IndexError si no encaja."""
-    tool_call = data["message"]["toolCalls"][0]
-    tool_call_id = tool_call["id"]
-    args = tool_call["function"].get("arguments", {})
-    if isinstance(args, str):
-        args = json.loads(args)
-    return tool_call_id, args
+    """
+    Devuelve (tool_call_id, arguments_dict).
+    Soporta dos formatos de Vapi:
+    - API Request (actual): el body son los argumentos directamente,
+      p. ej. {"consulta": "Ana"} o {"nombre_llamante": "...", ...}
+    - Custom Function (antiguo): {"message": {"toolCalls": [{...}]}}
+    """
+    # Formato antiguo (envuelto en message.toolCalls)
+    if isinstance(data, dict) and "message" in data and "toolCalls" in data.get("message", {}):
+        tool_call = data["message"]["toolCalls"][0]
+        tool_call_id = tool_call["id"]
+        args = tool_call["function"].get("arguments", {})
+        if isinstance(args, str):
+            args = json.loads(args)
+        return tool_call_id, args
+
+    # Formato API Request (plano): el body son los argumentos
+    # No tenemos toolCallId, devolvemos None y respondemos sin él
+    return None, (data or {})
 
 
 def enviar_email_recado(asunto: str, cuerpo_html: str) -> bool:
@@ -156,9 +168,10 @@ def buscar_directorio():
     else:
         resultado = {"match": "varios", "personas": coincidencias}
 
-    return jsonify(
-        {"results": [{"toolCallId": tool_call_id, "result": resultado}]}
-    )
+    # Formato de respuesta: si hay toolCallId, envolver; si no, plano.
+    if tool_call_id:
+        return jsonify({"results": [{"toolCallId": tool_call_id, "result": resultado}]})
+    return jsonify({"result": resultado})
 
 
 # ---------------------------------------------------------------------------
@@ -211,9 +224,9 @@ def tomar_mensaje():
             "Despide al llamante con normalidad; el incidente queda registrado."
         )
 
-    return jsonify(
-        {"results": [{"toolCallId": tool_call_id, "result": resultado}]}
-    )
+    if tool_call_id:
+        return jsonify({"results": [{"toolCallId": tool_call_id, "result": resultado}]})
+    return jsonify({"result": resultado})
 
 
 if __name__ == "__main__":
