@@ -19,8 +19,8 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 # Configuración (lee variables de entorno de Railway)
 # ---------------------------------------------------------------------------
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-EMAIL_DESTINO = os.environ.get("EMAIL_DESTINO", "")
+GMAIL_USER = os.environ.get("GMAIL_USER", "")
+GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "")
 
 # ---------------------------------------------------------------------------
 # Directorio de prueba (Clasquin).
@@ -96,37 +96,29 @@ def extraer_tool_call(data: dict):
     return None, (data or {})
 
 
-def enviar_email_recado(asunto: str, cuerpo_html: str) -> bool:
-    """Envía un email usando la API HTTP de Resend. Devuelve True si OK."""
-    if not RESEND_API_KEY or not EMAIL_DESTINO:
-        print("[email] Falta RESEND_API_KEY o EMAIL_DESTINO en variables de entorno", flush=True)
+def enviar_email_recado(asunto: str, cuerpo_html: str, destino: str) -> bool:
+    """Envía un email usando Gmail SMTP. Devuelve True si OK."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    if not GMAIL_USER or not GMAIL_PASSWORD:
+        print("[email] Falta GMAIL_USER o GMAIL_PASSWORD en variables de entorno", flush=True)
         return False
 
-    payload = {
-        # 'onboarding@resend.dev' es el remitente de pruebas que da Resend sin verificar dominio.
-        # Cuando tengas tu propio dominio verificado en Resend, cambia esto por noreply@tudominio.com
-        "from": "Operadora Virtual <onboarding@resend.dev>",
-        "to": [EMAIL_DESTINO],
-        "subject": asunto,
-        "html": cuerpo_html,
-    }
-
-    req = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            print(f"[email] Enviado OK status={resp.status}", flush=True)
-            return True
-    except urllib.error.HTTPError as e:
-        print(f"[email] HTTPError {e.code}: {e.read().decode('utf-8', errors='ignore')}", flush=True)
-        return False
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = asunto
+        msg["From"] = f"Operadora Virtual <{GMAIL_USER}>"
+        msg["To"] = destino
+        msg.attach(MIMEText(cuerpo_html, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(GMAIL_USER, GMAIL_PASSWORD)
+            server.sendmail(GMAIL_USER, destino, msg.as_string())
+
+        print(f"[email] Enviado OK a {destino}", flush=True)
+        return True
     except Exception as e:
         print(f"[email] Error: {e}", flush=True)
         return False
@@ -210,7 +202,7 @@ def tomar_mensaje():
     <b>Urgencia:</b> {urgencia}</p>
     """
 
-    ok = enviar_email_recado(asunto, cuerpo)
+    ok = enviar_email_recado(asunto, cuerpo, GMAIL_USER)
     print(f"[tomar_mensaje] email_enviado={ok}", flush=True)
 
     if ok:
