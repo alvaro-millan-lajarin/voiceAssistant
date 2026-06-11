@@ -1,123 +1,189 @@
 """
 Backend de la operadora virtual.
-Expone los endpoints que Vapi llamará como Custom Tools.
 
-Endpoints:
-- GET  /                  Health check
-- POST /buscar_directorio Busca persona o departamento en el directorio
-- POST /tomar_mensaje     Recibe un recado y lo envía por email
+Endpoints Vapi (Custom Tools):
+- POST /buscar_directorio     Busca persona y devuelve teléfono para warm transfer
+- POST /tomar_mensaje         Guarda recado en BD y envía email
+
+Endpoints Admin (requieren cabecera X-API-Key):
+- GET    /admin/directorio          Lista el directorio completo
+- POST   /admin/directorio          Añade persona
+- PUT    /admin/directorio/<id>     Edita persona (nombre, teléfono, alias…)
+- DELETE /admin/directorio/<id>     Elimina persona
+- GET    /admin/recados             Lista recados recibidos (últimos 200)
 """
 
 import os
 import json
-import urllib.request
-import urllib.error
+import smtplib
+from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from functools import wraps
+
 from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuración (lee variables de entorno de Railway)
+# Configuración
 # ---------------------------------------------------------------------------
-GMAIL_USER = os.environ.get("GMAIL_USER", "")
+_db_url = os.environ.get("DATABASE_URL", "sqlite:///operadora.db")
+# Railway a veces entrega postgres:// — SQLAlchemy 2.x necesita postgresql://
+if _db_url.startswith("postgres://"):
+    _db_url = _db_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = _db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+GMAIL_USER     = os.environ.get("GMAIL_USER", "")
 GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "")
+ADMIN_API_KEY  = os.environ.get("ADMIN_API_KEY", "")
+
+db = SQLAlchemy(app)
+
 
 # ---------------------------------------------------------------------------
-# Directorio de prueba (Clasquin).
+# Modelos
 # ---------------------------------------------------------------------------
-DIRECTORIO = [
-    {
-        "id": "ana_aduanas",
-        "nombre": "Ana",
-        "departamento": "Aduanas",
-        "alias": ["aduanas", "ana de aduanas", "ana aduanas"],
-    },
-    {
-        "id": "ana_export",
-        "nombre": "Ana",
-        "departamento": "Exportación",
-        "alias": ["exportacion", "exportación", "export", "ana export"],
-    },
-    {
-        "id": "carlos_comercial",
-        "nombre": "Carlos",
-        "departamento": "Comercial",
-        "alias": ["comercial", "ventas", "carlos"],
-    },
-    {
-        "id": "recepcion_general",
-        "nombre": "Recepción",
-        "departamento": "General",
-        "alias": ["general", "información", "recepción", "recepcion"],
-    },
+class Persona(db.Model):
+    __tablename__ = "directorio"
+
+    id           = db.Column(db.String(50),  primary_key=True)
+    nombre       = db.Column(db.String(100), nullable=False)
+    departamento = db.Column(db.String(100), nullable=False)
+    telefono     = db.Column(db.String(20),  default="")
+    email        = db.Column(db.String(100), default="")
+    _alias       = db.Column("alias", db.Text, default="[]")
+    activo       = db.Column(db.Boolean, default=True)
+
+    @property
+    def alias(self):
+        return json.loads(self._alias or "[]")
+
+    @alias.setter
+    def alias(self, value):
+        self._alias = json.dumps(value or [])
+
+    def to_dict(self):
+        return {
+            "id":           self.id,
+            "nombre":       self.nombre,
+            "departamento": self.departamento,
+            "telefono":     self.telefono,
+            "email":        self.email,
+            "alias":        self.alias,
+            "activo":       self.activo,
+        }
+
+
+class Recado(db.Model):
+    __tablename__ = "recados"
+
+    id                = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    nombre_llamante   = db.Column(db.String(100))
+    empresa           = db.Column(db.String(100))
+    destino_deseado   = db.Column(db.String(100))
+    motivo            = db.Column(db.Text)
+    telefono_contacto = db.Column(db.String(20))
+    urgencia          = db.Column(db.String(20), default="normal")
+    email_enviado     = db.Column(db.Boolean, default=False)
+    created_at        = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "id":                self.id,
+            "nombre_llamante":   self.nombre_llamante,
+            "empresa":           self.empresa,
+            "destino_deseado":   self.destino_deseado,
+            "motivo":            self.motivo,
+            "telefono_contacto": self.telefono_contacto,
+            "urgencia":          self.urgencia,
+            "email_enviado":     self.email_enviado,
+            "created_at":        self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Seed inicial
+# ---------------------------------------------------------------------------
+_SEED = [
+    {"id": "ana_aduanas",      "nombre": "Ana",       "departamento": "Aduanas",     "alias": ["aduanas", "ana de aduanas", "ana aduanas"]},
+    {"id": "ana_export",       "nombre": "Ana",       "departamento": "Exportación", "alias": ["exportacion", "exportación", "export", "ana export"]},
+    {"id": "carlos_comercial", "nombre": "Carlos",    "departamento": "Comercial",   "alias": ["comercial", "ventas", "carlos"]},
+    {"id": "recepcion_general","nombre": "Recepción", "departamento": "General",     "alias": ["general", "información", "recepción", "recepcion"]},
 ]
 
+def _init_db():
+    db.create_all()
+    if Persona.query.count() == 0:
+        for d in _SEED:
+            p = Persona(id=d["id"], nombre=d["nombre"], departamento=d["departamento"])
+            p.alias = d["alias"]
+            db.session.add(p)
+        db.session.commit()
+        print("[db] Directorio inicial cargado", flush=True)
 
-def buscar_en_directorio(consulta: str):
+
+# ---------------------------------------------------------------------------
+# Auth para endpoints admin
+# ---------------------------------------------------------------------------
+def require_api_key(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not ADMIN_API_KEY or request.headers.get("X-API-Key") != ADMIN_API_KEY:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _buscar(consulta: str):
     if not consulta:
         return []
     q = consulta.lower().strip()
-    coincidencias = []
-    for p in DIRECTORIO:
-        if (
-            q in p["nombre"].lower()
-            or q in p["departamento"].lower()
-            or any(q in a or a in q for a in p["alias"])
-        ):
-            coincidencias.append(
-                {
-                    "id": p["id"],
-                    "nombre": p["nombre"],
-                    "departamento": p["departamento"],
-                }
-            )
-    return coincidencias
+    return [
+        p for p in Persona.query.filter_by(activo=True).all()
+        if q in p.nombre.lower()
+        or q in p.departamento.lower()
+        or any(q in a or a in q for a in p.alias)
+    ]
 
 
-def extraer_tool_call(data: dict):
-    """
-    Devuelve (tool_call_id, arguments_dict).
-    Soporta dos formatos de Vapi:
-    - API Request (actual): el body son los argumentos directamente,
-      p. ej. {"consulta": "Ana"} o {"nombre_llamante": "...", ...}
-    - Custom Function (antiguo): {"message": {"toolCalls": [{...}]}}
-    """
-    # Formato antiguo (envuelto en message.toolCalls)
-    if isinstance(data, dict) and "message" in data and "toolCalls" in data.get("message", {}):
-        tool_call = data["message"]["toolCalls"][0]
-        tool_call_id = tool_call["id"]
-        args = tool_call["function"].get("arguments", {})
+def _extraer_tool_call(data: dict):
+    """Soporta el formato envuelto (message.toolCalls) y el formato plano de Vapi."""
+    if isinstance(data, dict) and "toolCalls" in data.get("message", {}):
+        tc   = data["message"]["toolCalls"][0]
+        args = tc["function"].get("arguments", {})
         if isinstance(args, str):
             args = json.loads(args)
-        return tool_call_id, args
-
-    # Formato API Request (plano): el body son los argumentos
-    # No tenemos toolCallId, devolvemos None y respondemos sin él
+        return tc["id"], args
     return None, (data or {})
 
 
-def enviar_email_recado(asunto: str, cuerpo_html: str, destino: str) -> bool:
-    """Envía un email usando Gmail SMTP. Devuelve True si OK."""
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
+def _responder_vapi(tool_call_id, resultado):
+    if tool_call_id:
+        return jsonify({"results": [{"toolCallId": tool_call_id, "result": resultado}]})
+    return jsonify({"result": resultado})
 
+
+def _enviar_email(asunto: str, cuerpo_html: str, destino: str) -> bool:
     if not GMAIL_USER or not GMAIL_PASSWORD:
-        print("[email] Falta GMAIL_USER o GMAIL_PASSWORD en variables de entorno", flush=True)
+        print("[email] Faltan credenciales", flush=True)
         return False
-
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = asunto
-        msg["From"] = f"Operadora Virtual <{GMAIL_USER}>"
-        msg["To"] = destino
+        msg["From"]    = f"Operadora Virtual <{GMAIL_USER}>"
+        msg["To"]      = destino
         msg.attach(MIMEText(cuerpo_html, "html"))
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
-            server.login(GMAIL_USER, GMAIL_PASSWORD)
-            server.sendmail(GMAIL_USER, destino, msg.as_string())
-
-        print(f"[email] Enviado OK a {destino}", flush=True)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as s:
+            s.login(GMAIL_USER, GMAIL_PASSWORD)
+            s.sendmail(GMAIL_USER, destino, msg.as_string())
+        print(f"[email] OK → {destino}", flush=True)
         return True
     except Exception as e:
         print(f"[email] Error: {e}", flush=True)
@@ -133,7 +199,8 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Tool: buscar_directorio
+# Tool Vapi: buscar_directorio
+# Devuelve teléfono para que Vapi ejecute el warm transfer
 # ---------------------------------------------------------------------------
 @app.post("/buscar_directorio")
 def buscar_directorio():
@@ -141,34 +208,52 @@ def buscar_directorio():
     print("[buscar_directorio] payload:", data, flush=True)
 
     try:
-        tool_call_id, args = extraer_tool_call(data)
+        tool_call_id, args = _extraer_tool_call(data)
         consulta = args.get("consulta", "")
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         print(f"[buscar_directorio] error parseando: {e}", flush=True)
         return jsonify({"results": []}), 400
 
-    coincidencias = buscar_en_directorio(consulta)
-    print(f"[buscar_directorio] '{consulta}' -> {coincidencias}", flush=True)
+    coincidencias = _buscar(consulta)
+    print(f"[buscar_directorio] '{consulta}' → {[p.id for p in coincidencias]}", flush=True)
 
     if not coincidencias:
         resultado = (
-            "Sin coincidencias. Ofrece al llamante transferir a recepción "
-            "general o tomar un mensaje."
+            "No he encontrado a nadie con ese nombre o departamento. "
+            "Pregunta al llamante si quiere que le pases con recepción general "
+            "o prefiere dejar un mensaje."
         )
     elif len(coincidencias) == 1:
-        resultado = {"match": "unico", "persona": coincidencias[0]}
+        p = coincidencias[0]
+        resultado = {
+            "match":   "unico",
+            "persona": {
+                "id":           p.id,
+                "nombre":       p.nombre,
+                "departamento": p.departamento,
+                "telefono":     p.telefono or None,
+            },
+        }
     else:
-        resultado = {"match": "varios", "personas": coincidencias}
+        resultado = {
+            "match":    "varios",
+            "personas": [
+                {
+                    "id":           p.id,
+                    "nombre":       p.nombre,
+                    "departamento": p.departamento,
+                    "telefono":     p.telefono or None,
+                }
+                for p in coincidencias
+            ],
+        }
 
-    # Formato de respuesta: si hay toolCallId, envolver; si no, plano.
-    if tool_call_id:
-        return jsonify({"results": [{"toolCallId": tool_call_id, "result": resultado}]})
-    return jsonify({"result": resultado})
+    return _responder_vapi(tool_call_id, resultado)
 
 
 # ---------------------------------------------------------------------------
-# Tool: tomar_mensaje
-# Recibe los datos del recado y lo envía por email al destinatario.
+# Tool Vapi: tomar_mensaje
+# Guarda el recado en BD y lo envía por email
 # ---------------------------------------------------------------------------
 @app.post("/tomar_mensaje")
 def tomar_mensaje():
@@ -176,17 +261,27 @@ def tomar_mensaje():
     print("[tomar_mensaje] payload:", data, flush=True)
 
     try:
-        tool_call_id, args = extraer_tool_call(data)
+        tool_call_id, args = _extraer_tool_call(data)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         print(f"[tomar_mensaje] error parseando: {e}", flush=True)
         return jsonify({"results": []}), 400
 
-    nombre = args.get("nombre_llamante", "(no facilitado)")
-    empresa = args.get("empresa", "(no facilitada)")
-    destino = args.get("destino_deseado", "(no especificado)")
-    motivo = args.get("motivo", "(sin detalle)")
+    nombre   = args.get("nombre_llamante",   "(no facilitado)")
+    empresa  = args.get("empresa",           "(no facilitada)")
+    destino  = args.get("destino_deseado",   "(no especificado)")
+    motivo   = args.get("motivo",            "(sin detalle)")
     telefono = args.get("telefono_contacto", "(no facilitado)")
-    urgencia = args.get("urgencia", "normal")
+    urgencia = args.get("urgencia",          "normal")
+
+    recado = Recado(
+        nombre_llamante=nombre,
+        empresa=empresa,
+        destino_deseado=destino,
+        motivo=motivo,
+        telefono_contacto=telefono,
+        urgencia=urgencia,
+    )
+    db.session.add(recado)
 
     asunto = f"[Recado] {nombre} pregunta por {destino}"
     if urgencia.lower() == "urgente":
@@ -194,32 +289,100 @@ def tomar_mensaje():
 
     cuerpo = f"""
     <h2>Nuevo recado de la operadora</h2>
-    <p><b>Quién llama:</b> {nombre}<br>
-    <b>Empresa:</b> {empresa}<br>
-    <b>Pregunta por:</b> {destino}<br>
-    <b>Motivo:</b> {motivo}<br>
-    <b>Teléfono de contacto:</b> {telefono}<br>
-    <b>Urgencia:</b> {urgencia}</p>
+    <p>
+      <b>Quién llama:</b> {nombre}<br>
+      <b>Empresa:</b> {empresa}<br>
+      <b>Pregunta por:</b> {destino}<br>
+      <b>Motivo:</b> {motivo}<br>
+      <b>Teléfono de contacto:</b> {telefono}<br>
+      <b>Urgencia:</b> {urgencia}
+    </p>
     """
 
-    ok = enviar_email_recado(asunto, cuerpo, GMAIL_USER)
-    print(f"[tomar_mensaje] email_enviado={ok}", flush=True)
+    ok = _enviar_email(asunto, cuerpo, GMAIL_USER)
+    recado.email_enviado = ok
+    db.session.commit()
+    print(f"[tomar_mensaje] id={recado.id} email_enviado={ok}", flush=True)
 
-    if ok:
-        resultado = (
-            "Mensaje registrado y enviado al destinatario correctamente. "
-            "Confirma al llamante que se le devolverá la llamada lo antes posible."
-        )
-    else:
-        resultado = (
-            "El mensaje se ha recogido pero hubo un problema al notificarlo. "
-            "Despide al llamante con normalidad; el incidente queda registrado."
-        )
+    resultado = (
+        "Mensaje registrado y enviado correctamente. "
+        "Confirma al llamante que se le devolverá la llamada lo antes posible."
+        if ok else
+        "Mensaje guardado, pero hubo un problema al enviarlo por email. "
+        "Despide al llamante con normalidad; el recado queda registrado en el sistema."
+    )
+    return _responder_vapi(tool_call_id, resultado)
 
-    if tool_call_id:
-        return jsonify({"results": [{"toolCallId": tool_call_id, "result": resultado}]})
-    return jsonify({"result": resultado})
 
+# ---------------------------------------------------------------------------
+# Admin: CRUD directorio
+# ---------------------------------------------------------------------------
+@app.get("/admin/directorio")
+@require_api_key
+def admin_list():
+    return jsonify([p.to_dict() for p in Persona.query.order_by(Persona.departamento).all()])
+
+
+@app.post("/admin/directorio")
+@require_api_key
+def admin_create():
+    body = request.get_json(silent=True) or {}
+    if not body.get("id") or not body.get("nombre") or not body.get("departamento"):
+        return jsonify({"error": "id, nombre y departamento son obligatorios"}), 400
+    if Persona.query.get(body["id"]):
+        return jsonify({"error": "Ya existe una persona con ese id"}), 409
+    p = Persona(
+        id=body["id"],
+        nombre=body["nombre"],
+        departamento=body["departamento"],
+        telefono=body.get("telefono", ""),
+        email=body.get("email", ""),
+        activo=body.get("activo", True),
+    )
+    p.alias = body.get("alias", [])
+    db.session.add(p)
+    db.session.commit()
+    return jsonify(p.to_dict()), 201
+
+
+@app.put("/admin/directorio/<string:persona_id>")
+@require_api_key
+def admin_update(persona_id):
+    p = Persona.query.get_or_404(persona_id)
+    body = request.get_json(silent=True) or {}
+    for field in ("nombre", "departamento", "telefono", "email", "activo"):
+        if field in body:
+            setattr(p, field, body[field])
+    if "alias" in body:
+        p.alias = body["alias"]
+    db.session.commit()
+    return jsonify(p.to_dict())
+
+
+@app.delete("/admin/directorio/<string:persona_id>")
+@require_api_key
+def admin_delete(persona_id):
+    p = Persona.query.get_or_404(persona_id)
+    db.session.delete(p)
+    db.session.commit()
+    return jsonify({"deleted": persona_id})
+
+
+# ---------------------------------------------------------------------------
+# Admin: recados
+# ---------------------------------------------------------------------------
+@app.get("/admin/recados")
+@require_api_key
+def admin_recados():
+    recados = Recado.query.order_by(Recado.created_at.desc()).limit(200).all()
+    return jsonify([r.to_dict() for r in recados])
+
+
+# ---------------------------------------------------------------------------
+# Arranque
+# ---------------------------------------------------------------------------
+with app.app_context():
+    _init_db()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
