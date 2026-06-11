@@ -315,6 +315,67 @@ def tomar_mensaje():
 
 
 # ---------------------------------------------------------------------------
+# Tool Vapi: transferir_llamada
+# Busca el teléfono en la BD y devuelve la instrucción de transferencia a Vapi.
+# Así el número vive solo en la BD — no hay que tocarlo en Vapi.
+# ---------------------------------------------------------------------------
+@app.post("/transferir")
+def transferir():
+    data = request.get_json(silent=True) or {}
+    print("[transferir] payload:", data, flush=True)
+
+    try:
+        tool_call_id, args = _extraer_tool_call(data)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        print(f"[transferir] error parseando: {e}", flush=True)
+        return jsonify({"results": []}), 400
+
+    persona_id      = args.get("persona_id", "")
+    nombre_llamante = args.get("nombre_llamante", "el llamante")
+    empresa         = args.get("empresa", "")
+    motivo          = args.get("motivo", "una consulta")
+
+    persona = Persona.query.get(persona_id)
+
+    if not persona or not persona.telefono:
+        resultado = (
+            "No se pudo transferir: persona no encontrada o sin teléfono configurado. "
+            "Ofrece al llamante dejar un mensaje."
+        )
+        return _responder_vapi(tool_call_id, resultado)
+
+    empresa_txt    = f" de {empresa}" if empresa else ""
+    msg_susurro    = (
+        f"Hola {persona.nombre}, te paso con {nombre_llamante}{empresa_txt}, "
+        f"llama por {motivo}."
+    )
+
+    print(f"[transferir] → {persona.nombre} ({persona.telefono})", flush=True)
+
+    destino = {
+        "type": "number",
+        "number": persona.telefono,
+        "transferPlan": {
+            "mode": "warm-transfer-say-message",
+            "message": msg_susurro,
+        },
+    }
+
+    if tool_call_id:
+        return jsonify({
+            "results": [{
+                "toolCallId": tool_call_id,
+                "result": f"Transfiriendo con {persona.nombre} ({persona.departamento}).",
+                "destination": destino,
+            }]
+        })
+    return jsonify({
+        "result": f"Transfiriendo con {persona.nombre} ({persona.departamento}).",
+        "destination": destino,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Admin: CRUD directorio
 # ---------------------------------------------------------------------------
 @app.get("/admin/directorio")
