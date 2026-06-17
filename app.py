@@ -16,6 +16,9 @@ Endpoints Admin (requieren cabecera X-API-Key):
 import os
 import json
 import smtplib
+from dotenv import load_dotenv
+
+load_dotenv()
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -154,20 +157,37 @@ def _buscar(consulta: str):
 
 
 def _extraer_tool_call(data: dict):
-    """Soporta el formato envuelto (message.toolCalls) y el formato plano de Vapi."""
-    if isinstance(data, dict) and "toolCalls" in data.get("message", {}):
-        tc   = data["message"]["toolCalls"][0]
+    """Soporta todos los formatos de Vapi: message.toolCalls y toolCalls raíz."""
+    if not isinstance(data, dict):
+        return None, {}
+    # Formato 1: { "message": { "toolCalls": [...] } }
+    tc_list = data.get("message", {}).get("toolCalls")
+    # Formato 2: { "toolCalls": [...] }  (top-level, formato más común)
+    if not tc_list:
+        tc_list = data.get("toolCalls")
+    if tc_list:
+        tc   = tc_list[0]
         args = tc["function"].get("arguments", {})
         if isinstance(args, str):
             args = json.loads(args)
+        print(f"[tool_call] id={tc['id']} args={args}", flush=True)
         return tc["id"], args
+    # Fallback: args planos en el body
+    print("[tool_call] formato no reconocido, usando body completo", flush=True)
     return None, (data or {})
 
 
-def _responder_vapi(tool_call_id, resultado):
+def _responder_vapi(tool_call_id, resultado, destination=None):
     if tool_call_id:
-        return jsonify({"results": [{"toolCallId": tool_call_id, "result": resultado}]})
-    return jsonify({"result": resultado})
+        entry = {"toolCallId": tool_call_id, "result": resultado}
+        if destination:
+            entry["destination"] = destination
+        return jsonify({"results": [entry]})
+    # Fallback sin toolCallId (no debería llegar aquí con el fix de arriba)
+    resp = {"result": resultado}
+    if destination:
+        resp["destination"] = destination
+    return jsonify(resp)
 
 
 def _enviar_email(asunto: str, cuerpo_html: str, destino: str) -> bool:
@@ -361,18 +381,11 @@ def transferir():
         },
     }
 
-    if tool_call_id:
-        return jsonify({
-            "results": [{
-                "toolCallId": tool_call_id,
-                "result": f"Transfiriendo con {persona.nombre} ({persona.departamento}).",
-                "destination": destino,
-            }]
-        })
-    return jsonify({
-        "result": f"Transfiriendo con {persona.nombre} ({persona.departamento}).",
-        "destination": destino,
-    })
+    return _responder_vapi(
+        tool_call_id,
+        f"Transfiriendo con {persona.nombre} ({persona.departamento}).",
+        destination=destino,
+    )
 
 
 # ---------------------------------------------------------------------------
