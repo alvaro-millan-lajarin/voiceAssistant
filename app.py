@@ -376,8 +376,7 @@ def transferir():
         "type": "number",
         "number": persona.telefono,
         "transferPlan": {
-            "mode": "warm-transfer-say-message",
-            "message": msg_susurro,
+            "mode": "blind-transfer",
         },
     }
 
