@@ -364,7 +364,11 @@ def transferir():
         )
         return _responder_vapi(tool_call_id, resultado)
 
-    print(f"[transferir] → {persona.nombre} ({persona.telefono})", flush=True)
+    print(
+        f"[transferir] {nombre_llamante} ({empresa}) → {persona.nombre} "
+        f"({persona.telefono}) motivo={motivo}",
+        flush=True,
+    )
 
     destino = {
         "type": "number",
