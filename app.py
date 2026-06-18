@@ -364,12 +364,6 @@ def transferir():
         )
         return _responder_vapi(tool_call_id, resultado)
 
-    empresa_txt    = f" de {empresa}" if empresa else ""
-    msg_susurro    = (
-        f"Hola {persona.nombre}, te paso con {nombre_llamante}{empresa_txt}, "
-        f"llama por {motivo}."
-    )
-
     print(f"[transferir] → {persona.nombre} ({persona.telefono})", flush=True)
 
     destino = {
